@@ -1,0 +1,65 @@
+[
+  {
+    "service": "checkout-api",
+    "date": "2026-09-12",
+    "symptom": "PagerDuty alert fired at 14:02 UTC: checkout-api error rate jumped to 95% (threshold 5%). Users saw \"Unable to complete purchase\" errors on the checkout page.",
+    "error_log": "2026-09-12T14:03:27.842Z ERROR checkout-api - db_pool_exhausted: connection pool exhausted (max 30 connections, 30 in use) | metric DB_CONNECTION_POOL_USAGE{service=\"checkout-api\"}=30/30",
+    "root_cause": "A sudden traffic spike from the Black Friday promotion increased concurrent checkout requests. The DB connection pool was configured with a max size of 30, which was insufficient; long\u2011running SELECT queries held connections, causing the pool to fill and new requests to be rejected.",
+    "fix": "helm upgrade checkout-api ./chart --set db.poolSize=100 && kubectl rollout restart deployment/checkout-api -n prod",
+    "resolution_minutes": 38
+  },
+  {
+    "service": "auth-service",
+    "date": "2026-09-15",
+    "symptom": "Spike in 5xx error rate to 23% and alerts from Datadog SLO breach; users reported login failures.",
+    "error_log": "2026-09-15T14:23:07.421Z ERROR [auth-service] auth.handler: token validation failed: unexpected token format (error=invalid_token_signature, user_id=12345)",
+    "root_cause": "The 2026-09-15 14:10 UTC deployment introduced a new JWT validation library with an incorrect configuration flag (ALLOW_NONE_ALGORITHM=true). This caused all tokens signed with RS256 to be rejected, leading to cascading authentication failures across all downstream services.",
+    "fix": "Executed rollback to previous version: `kubectl rollout undo deployment/auth-service -n prod` and removed the faulty config flag from configmap `auth-config` (set ALLOW_NONE_ALGORITHM=false), then re\u2011applied the config with `kubectl apply -f auth-config.yaml`.",
+    "resolution_minutes": 42
+  },
+  {
+    "service": "payments-worker",
+    "date": "2026-09-12",
+    "symptom": "Prometheus alert \"PaymentsWorkerAuthFailure\" fired at 14:20 UTC (5xx error rate spiked to 12%); customers reported \"payment could not be processed\" errors in the checkout flow.",
+    "error_log": "2026-09-12T14:23:45Z ERROR tls: failed to verify certificate: x509: certificate has expired or is not yet valid (service: payments-worker, peer: auth-service)",
+    "root_cause": "The mTLS client certificate used by payments-worker to authenticate to auth-service had expired on 2026-09-09, causing TLS handshake failures for every inter\u2011service call.",
+    "fix": "Renewed the auth-service certificate with `certbot renew --cert-name auth-service`; copied the new cert bundle to the shared secret volume; then executed `kubectl rollout restart deployment/payments-worker` to reload the updated certificates.",
+    "resolution_minutes": 42
+  },
+  {
+    "service": "search-api",
+    "date": "2026-09-12",
+    "symptom": "Alert: search latency > 2s for 95th percentile (triggered at 14:02 UTC). Users reported timeouts on the UI. Error rate spiked to 12.4% (vs normal 0.3%).",
+    "error_log": "2026-09-12T14:03:27.842Z ERROR [search-api] cache miss for key 'query:weather:paris' - fallback to DB timed out after 5000ms (error: context deadline exceeded)",
+    "root_cause": "Cache stampede after a cold restart: the Redis cache was empty following a pod restart, and 1,200 concurrent requests all attempted to populate the same missing key, overwhelming the database and causing timeouts.",
+    "fix": "Ran `kubectl rollout restart deployment/search-api` to bring a fresh pod, then applied config change `kubectl set env deployment/search-api CACHE_PREWARM=true`. Merged PR #842 which adds jitter (0-200ms) to the lock acquisition in cache.go (line 112) and enables background pre\u2011warming of hot query keys. Finally cleared any stale keys with `redis-cli --scan --pattern 'query:*' | xargs -L1 redis-cli del`.",
+    "resolution_minutes": 27
+  },
+  {
+    "service": "checkout-api",
+    "date": "2026-09-10",
+    "symptom": "Prometheus alert `checkout_api_http_5xx_rate` > 5% for 2m, spike in user complaints: \"checkout fails with 500\" and increased 5xx error rate in Grafana dashboard",
+    "error_log": "2026-09-10T14:23:41.872Z ERROR checkout-api: failed to acquire DB connection: connection pool exhausted (max 100, in_use 100, wait_timeout 30s)",
+    "root_cause": "A flash\u2011sale promotion caused traffic to jump from ~300 to ~2,200 requests/minute. Each request opens a DB transaction that lasts ~250\u202fms. The PostgreSQL connection pool was capped at 100 connections, and because the surge saturated the pool, new requests timed out while waiting for a free connection, producing the pool\u2011exhaustion error.",
+    "fix": "Executed `kubectl set env deployment/checkout-api DB_POOL_MAX=200 && kubectl rollout restart deployment/checkout-api` to raise the pool limit to 200 and applied a new config `DB_CONNECTION_TIMEOUT=10s`. Also added a rate\u2011limit rule in the API gateway to cap checkout attempts at 1,000/minute.",
+    "resolution_minutes": 42
+  },
+  {
+    "service": "payments-worker",
+    "date": "2026-09-15",
+    "symptom": "Alert fired at 14:22 UTC: payments-worker error rate spiked to 12% (threshold 2%). Users reported failed checkout with \"Payment could not be processed\" messages.",
+    "error_log": "2026-09-15T14:23:07Z ERROR payments-worker: failed to charge transaction id=987654321 via Stripe: connection timeout (ETIMEDOUT) after 30s",
+    "root_cause": "Stripe API experienced a regional outage in the us-east-1 data center, returning HTTP 502 Bad Gateway for all charge requests during 14:20\u201314:45 UTC.",
+    "fix": "Edited the payments-worker ConfigMap to set PAYMENT_GATEWAY=braintree, then executed: kubectl rollout restart deployment/payments-worker --namespace=prod",
+    "resolution_minutes": 42
+  },
+  {
+    "service": "notifications-service",
+    "date": "2026-09-12",
+    "symptom": "Alert: OOMKilled container in notifications-service; user reports missing push notifications; error rate spiked to 23% in a 5\u2011minute window.",
+    "error_log": "2026-09-12T14:23:45Z kubelet: Container notifications-service-abc123 killed due to OOM (container_id=containerd://d5f7c9e2...; RSS=1.9GiB; limit=2GiB)",
+    "root_cause": "A recent deployment (v2.4.7) introduced a goroutine that retained references to incoming notification payload structs after they were sent, causing heap usage to grow by ~150\u202fMiB per minute until the pod hit the 2\u202fGiB memory limit and was OOM\u2011killed.",
+    "fix": "Rolled back to version v2.4.6 with `kubectl rollout undo deployment/notifications-service`; then applied hot\u2011fix patch releasing payload buffers (git commit abcdef9) and redeployed with `kubectl set image deployment/notifications-service notifications-service=repo/notifications-service:2.4.7-fix`.",
+    "resolution_minutes": 42
+  }
+]
