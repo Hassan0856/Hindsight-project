@@ -16,7 +16,6 @@ from agent import BANK_ID
 load_dotenv()
 
 
-
 def main():
     client = Hindsight(
         base_url=os.environ["HINDSIGHT_BASE_URL"],
@@ -24,15 +23,12 @@ def main():
     )
 
     # No explicit bank-creation step needed — the first retain() call
-    # below creates the "oncall-history" bank automatically.
+    # below creates the bank automatically.
 
     with open("incidents.json") as f:
         incidents = json.load(f)
 
     for inc in incidents:
-        # The date is embedded directly in the retained text — this is
-        # what lets the agent later say "this matches an incident from
-        # around [date]" when it recalls it.
         content = (
             f"Incident on {inc['date']} — service: {inc['service']}.\n"
             f"Symptom: {inc['symptom']}\n"

@@ -1,18 +1,12 @@
 """
 Lists everything Hindsight currently has for a bank — the seeded
-incidents plus anything retained since via chat.py, demo.py, or app.py.
-
-Useful whenever recall behaves unexpectedly: confirms whether a memory
-you expect is actually in the bank at all, before assuming the bug is
-in recall() or the prompt.
-
-NOTE: this uses client.list_memories(), which is a real documented call,
-but its exact return shape wasn't confirmed by the docs I could see, so
-this script sniffs a few likely attribute names defensively. If it
-errors, paste the traceback and we'll adjust to the real field names.
+incidents plus anything retained since. Run this FIRST whenever the
+agent seems to have "lost its memory" (e.g. every response says "no
+relevant historical incident found") — it tells you in one shot whether
+the bank actually has data, before you assume the code is broken.
 
 Usage:
-    python inspect_memory.py                    # inspects the default bank
+    python inspect_memory.py
     python inspect_memory.py --bank some-other-bank
 """
 
@@ -35,10 +29,7 @@ def _first_attr(obj, *names, default=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--bank", default=DEFAULT_BANK_ID,
-        help="Bank id to inspect (defaults to the HINDSIGHT_BANK_ID / agent's current bank)",
-    )
+    parser.add_argument("--bank", default=DEFAULT_BANK_ID)
     args = parser.parse_args()
 
     client = Hindsight(
@@ -52,12 +43,9 @@ def main():
         result = client.list_memories(bank_id=args.bank)
     except Exception as e:
         print(f"list_memories() failed: {e}")
-        print("(the call itself may need different arguments than assumed here)")
         client.close()
         return
 
-    # Field names for the response object aren't confirmed, so try the
-    # likely candidates before giving up.
     items = _first_attr(result, "results", "memories", "items", default=result)
     try:
         items = list(items)
@@ -65,8 +53,9 @@ def main():
         items = [items]
 
     if not items:
-        print("(bank is empty, or the response shape didn't match — "
-              "if you expected entries here, paste this output back)")
+        print("(bank is EMPTY — this is almost certainly why the agent "
+              "always says 'no relevant historical incident found'. "
+              "Run seed_incidents.py against this bank_id.)")
     else:
         for i, m in enumerate(items, 1):
             text = _first_attr(m, "text", "content", default=str(m))
@@ -81,9 +70,6 @@ def main():
             print(f"   {text}\n")
 
     print(f"Total: {len(items)} memories")
-    print("\n(Note: list_memories() may be paginated — if you seeded 18+ "
-          "incidents and see fewer here, there may be more on a later page.)")
-
     client.close()
 
 

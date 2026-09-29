@@ -19,8 +19,6 @@ from agent import MemoryAgent, BANK_ID
 
 load_dotenv()
 
-# Each turn is (narration_beat, message) so the terminal output doubles as
-# a teleprompter while you record.
 SCRIPT = [
     (
         "BEAT 1 — Honesty first. This is a novel problem, nothing like it exists "
@@ -57,6 +55,7 @@ SCRIPT = [
 
 
 def main():
+    print(f"Bank: {BANK_ID}\n")
     agent = MemoryAgent(bank_id=BANK_ID)
 
     for i, (beat, turn) in enumerate(SCRIPT, start=1):

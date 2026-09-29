@@ -1,11 +1,8 @@
 """
 Interactive chat with the incident response agent. Use this to poke at it
-yourself during development, and for live judge Q&A (the hackathon
-requires a "Live Project Demo to judges" — this is what you'd run for
-that, since demo.py is scripted/one-shot).
+yourself during development, and for live judge Q&A.
 
-Talks to the SAME bank as seed_incidents.py and demo.py, so anything you
-say here adds to the same memory the judges will see referenced later.
+Talks to the SAME bank as seed_incidents.py, demo.py and app.py.
 
 Usage:
     python chat.py
@@ -19,9 +16,9 @@ from agent import MemoryAgent, BANK_ID
 load_dotenv()
 
 
-
 def main():
-    print("Incident Response Agent — type an incident, or 'exit' to quit.\n")
+    print(f"Incident Response Agent — bank: {BANK_ID}")
+    print("Type an incident, or 'exit' to quit.\n")
     agent = MemoryAgent(bank_id=BANK_ID)
 
     try:
