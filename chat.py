@@ -36,6 +36,8 @@ def main():
 
             if log.recalled:
                 print(f"\n[recalled {len(log.recalled)} past memories]")
+                for i, m in enumerate(log.recalled, 1):
+                    print(f"  {i}. {m}")
             else:
                 print("\n[no matching past memories]")
 

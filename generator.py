@@ -38,7 +38,11 @@ FAILURE_MODES = [
 
 # Services in your fictional company — reuse these names across incidents
 # so recurring-service patterns are visible too, not just recurring causes.
-SERVICES = ["checkout-api", "auth-service", "payments-worker", "search-api", "notifications-service"]
+SERVICES = [
+    "checkout-api", "auth-service", "payments-worker", "search-api",
+    "notifications-service", "payment-api", "inventory-service",
+    "recommendation-engine",
+]
 
 SCHEMA_PROMPT = """You are generating ONE realistic incident postmortem entry for a
 fictional company's on-call history. Ground it in the failure mode given.
@@ -83,17 +87,44 @@ def generate_incident(failure_mode: str, service: str) -> dict:
 
 def main():
     incidents = []
-    # Deliberately generate a couple of REPEATS of the same failure mode
-    # on the same service, at different dates — this is what makes the
-    # "this matches an incident from 3 weeks ago" recall moment possible.
+    # Every failure mode appears on at least 2 DIFFERENT services, so
+    # cross-service pattern matches (the hardest recall case) aren't
+    # riding on a single hand-picked example. DB saturation gets 4
+    # instances across 3 services since that's the flagship demo pattern.
     plan = [
-        (FAILURE_MODES[0], SERVICES[0]),   # checkout-api DB pool exhaustion (older)
-        (FAILURE_MODES[1], SERVICES[1]),   # auth-service bad deploy
-        (FAILURE_MODES[2], SERVICES[2]),   # payments-worker cert expiry
-        (FAILURE_MODES[3], SERVICES[3]),   # search-api cache stampede
-        (FAILURE_MODES[0], SERVICES[0]),   # checkout-api DB pool exhaustion AGAIN (recent) <-- recall target
-        (FAILURE_MODES[4], SERVICES[2]),   # payments-worker third-party outage
-        (FAILURE_MODES[5], SERVICES[4]),   # notifications-service OOM
+        # --- DB connection pool / saturation cluster (flagship pattern) ---
+        (FAILURE_MODES[0], "checkout-api"),          # oldest
+        (FAILURE_MODES[0], "checkout-api"),          # recent recurrence, same service
+        (FAILURE_MODES[0], "payment-api"),           # cross-service match
+        (FAILURE_MODES[0], "inventory-service"),     # third cluster member
+
+        # --- bad deploy / config push ---
+        (FAILURE_MODES[1], "auth-service"),
+        (FAILURE_MODES[1], "search-api"),
+
+        # --- expired cert / TLS auth failures ---
+        (FAILURE_MODES[2], "payments-worker"),
+        (FAILURE_MODES[2], "auth-service"),
+
+        # --- cache stampede ---
+        (FAILURE_MODES[3], "search-api"),
+        (FAILURE_MODES[3], "recommendation-engine"),
+
+        # --- third-party dependency outage ---
+        (FAILURE_MODES[4], "payments-worker"),
+        (FAILURE_MODES[4], "notifications-service"),
+
+        # --- memory leak / OOM ---
+        (FAILURE_MODES[5], "notifications-service"),
+        (FAILURE_MODES[5], "recommendation-engine"),
+
+        # --- rate limit / quota exceeded ---
+        (FAILURE_MODES[6], "search-api"),
+        (FAILURE_MODES[6], "checkout-api"),
+
+        # --- race condition under concurrent load ---
+        (FAILURE_MODES[7], "checkout-api"),
+        (FAILURE_MODES[7], "inventory-service"),
     ]
 
     for failure_mode, service in plan:
@@ -105,6 +136,7 @@ def main():
         json.dump(incidents, f, indent=2)
 
     print(f"\nWrote {len(incidents)} incidents to incidents.json")
+    print("Coverage: all 8 failure modes, each on 2+ different services")
 
 
 if __name__ == "__main__":
