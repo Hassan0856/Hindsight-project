@@ -18,6 +18,7 @@ client bound to the original thread's event loop then fails with
 across calls on this class; network clients never do.
 """
 
+import asyncio
 import os
 import json
 from datetime import date
@@ -62,10 +63,9 @@ Rules:
      different ratios/wording, etc. Explain the shared pattern in one line,
      give the past fix as a hypothesis to try, and end that line with
      "Confidence: Medium".
-   - No relevant historical incident found: say this plainly and give at
-     most 4 short, generic triage steps. Do not import specific tools,
-     flags or config names from unrelated memories, and do not force a
-     match just because something was recalled.
+   - No relevant historical incident found: say exactly
+     "No relevant historical incident found." Do not add a match, advice,
+     or details from unrelated memories.
    If the report itself is too vague to judge (no service, no symptom),
    ask ONE clarifying question instead of guessing.
 5. Memories marked WORKED are proven fixes; DID NOT WORK means avoid them.
@@ -76,19 +76,25 @@ Never claim to remember anything that is not in the memories or the chat."""
 
 
 CLASSIFY_PROMPT = """You classify incident-history relevance. Compare the current
-incident with the recalled memories as a group, using the actual failure
-pattern: symptom class, error behavior, affected resource/infrastructure,
-and root cause when known. Service names and isolated shared words are not
-enough to establish a match.
+incident with each recalled memory using concrete dimensions: service,
+symptom class, error behavior, affected resource/infrastructure, root cause,
+and a recorded resolution or outcome. Ignore generic operational words such
+as deployment, configuration, service, restart, and failure unless specific
+technical evidence connects the incidents. A service's presence in a memory
+is not itself evidence of a shared failure pattern.
 
 Return only one JSON object: {\"verdict\": \"strong\" | \"partial\" | \"none\", \"evidence\": \"brief explanation\"}.
 
-Use strong only when both the symptom class and underlying failure/root-cause
-category closely align. Use partial when there is a meaningful shared failure
-pattern but important specifics differ or the cause is not established. Use
-none when the memories share only generic terms, describe a different failure,
-or provide no useful precedent. When uncertain, choose none. Never invent
-details absent from the incident or memories."""
+Use strong only when the service is the same AND at least two independent,
+meaningful failure dimensions align (for example, same symptom class plus same
+resource/root-cause pattern or specific error behavior). Use partial for a
+different service only when the underlying resource/root-cause pattern and
+symptoms meaningfully align; state this pattern as a hypothesis. A different
+service with a merely generic similarity is none. Use none when the incidents
+describe different problems, share only generic words, or the evidence is
+insufficient. Confirmed WORKED/DID NOT WORK outcomes are relevant evidence for
+which resolution to recommend, but do not by themselves establish a match.
+When uncertain, choose none. Never invent relationships or details."""
 
 
 EXTRACT_PROMPT = """You maintain an incident knowledge base. Read the engineer's
@@ -172,18 +178,18 @@ class MemoryAgent:
         """Choose a conservative verdict before asking the model to write advice."""
         if not memories:
             return "none", "No recalled historical incidents."
+        raw = llm.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": CLASSIFY_PROMPT},
+                {"role": "user", "content": (
+                    f"Current incident:\n{user_input}\n\nRecalled memories:\n" +
+                    "\n".join(f"- {memory}" for memory in memories)
+                )},
+            ],
+        ).choices[0].message.content.strip()
         try:
-            raw = llm.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": CLASSIFY_PROMPT},
-                    {"role": "user", "content": (
-                        f"Current incident:\n{user_input}\n\nRecalled memories:\n" +
-                        "\n".join(f"- {memory}" for memory in memories)
-                    )},
-                ],
-            ).choices[0].message.content.strip()
             raw = raw.replace("```json", "").replace("```", "").strip()
             result = json.loads(raw)
             verdict = result.get("verdict")
@@ -195,6 +201,10 @@ class MemoryAgent:
             return "none", "The recalled memories could not be reliably classified."
 
     def respond(self, user_input: str) -> TurnLog:
+        """Run one turn in a fresh event loop, isolated from Streamlit reruns."""
+        return asyncio.run(self._respond_async(user_input))
+
+    async def _respond_async(self, user_input: str) -> TurnLog:
         hindsight = self._new_hindsight_client()
         llm = self._new_llm_client()
         try:
@@ -202,37 +212,49 @@ class MemoryAgent:
             query = user_input
             if self.last_user_message:
                 query = f"{self.last_user_message[:500]}\n{user_input}"
-            # The Hindsight client controls recall output by token budget, not
-            # by a result-count `limit` argument. Cap the returned items below.
-            recall_result = hindsight.recall(bank_id=self.bank_id, query=query)
+            # Use the async SDK methods on the fresh loop owned by this turn.
+            recall_result = await hindsight.arecall(bank_id=self.bank_id, query=query)
             memories = [m.text for m in recall_result.results] if recall_result.results else []
             memories = memories[:MAX_MEMORIES]
             memory_block = "\n".join(f"- {m}" for m in memories) if memories else "(none)"
             verdict, evidence = self._classify_memories(llm, query, memories)
 
-            # 2. RESPOND: short-term history + long-term memories
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            messages += self.history[-MAX_HISTORY_MESSAGES:]
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Historical-match verdict: {verdict}\n"
-                    f"Classification evidence: {evidence}\n\n"
-                    f"Relevant memories:\n{memory_block}\n\nEngineer: {user_input}"
-                ),
-            })
-            response = llm.chat.completions.create(
-                model=self.model, messages=messages
-            ).choices[0].message.content
+            # A none verdict has one exact, deterministic response. The model
+            # cannot turn unrelated retrieval results into a forced connection.
+            if verdict == "none":
+                response = "No relevant historical incident found."
+            else:
+                # 2. RESPOND: short-term history + classified long-term memories
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages += self.history[-MAX_HISTORY_MESSAGES:]
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Historical-match verdict: {verdict}\n"
+                        f"Classification evidence: {evidence}\n\n"
+                        f"Relevant memories:\n{memory_block}\n\nEngineer: {user_input}"
+                    ),
+                })
+                response = llm.chat.completions.create(
+                    model=self.model, messages=messages
+                ).choices[0].message.content
+                if verdict == "strong" and not response.lstrip().lower().startswith("strong match"):
+                    response = f"Strong match — {response}"
+                elif verdict == "partial":
+                    if not response.lstrip().lower().startswith("partial match"):
+                        response = f"Partial match — {response}"
+                    if not response.rstrip().lower().endswith("confidence: medium"):
+                        response = f"{response.rstrip()}\nConfidence: Medium"
 
             # 3. RETAIN: only clean facts, never the agent's own advice
             summary = self._extract_memory(llm, user_input)
             retained = ""
             if summary:
                 retained = f"[{date.today().isoformat()}] {summary}"
-                hindsight.retain(bank_id=self.bank_id, content=retained)
+                await hindsight.aretain(bank_id=self.bank_id, content=retained)
         finally:
-            hindsight.close()
+            await hindsight.aclose()
+            llm.close()
 
         self.history.append({"role": "user", "content": user_input})
         self.history.append({"role": "assistant", "content": response})
