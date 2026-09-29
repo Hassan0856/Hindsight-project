@@ -32,10 +32,7 @@ load_dotenv()
 BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "oncall-history")
 
 MAX_HISTORY_MESSAGES = 6   # short-term memory: last 3 exchanges
-RECALL_LIMIT = 12          # ask Hindsight for this many raw candidates...
-MAX_MEMORIES = 8           # ...then feed up to this many to the LLM (it already
-                            # reasons about which are actually relevant, so err
-                            # toward more candidates rather than fewer)
+MAX_MEMORIES = 8           # cap memories passed to the LLM
 
 
 SYSTEM_PROMPT = """You are an on-call incident response assistant. You have
@@ -159,7 +156,9 @@ class MemoryAgent:
             query = user_input
             if self.last_user_message:
                 query = f"{self.last_user_message[:500]}\n{user_input}"
-            recall_result = hindsight.recall(bank_id=self.bank_id, query=query, limit=RECALL_LIMIT)
+            # The Hindsight client controls recall output by token budget, not
+            # by a result-count `limit` argument. Cap the returned items below.
+            recall_result = hindsight.recall(bank_id=self.bank_id, query=query)
             memories = [m.text for m in recall_result.results] if recall_result.results else []
             memories = memories[:MAX_MEMORIES]
             memory_block = "\n".join(f"- {m}" for m in memories) if memories else "(none)"
