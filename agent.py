@@ -42,14 +42,17 @@ and you can see the current conversation.
 Rules:
 1. Follow-ups matter. If the engineer says a fix did not work, do NOT repeat
    that fix. Say what it rules out and propose the next most likely cause.
-2. For each recalled memory, judge it on ALL of these together, not any one
+2. A separate classifier supplies a "Historical-match verdict" and evidence
+   in the latest user message. Treat that verdict as authoritative: do not
+   upgrade or replace it. Use only the matching response branch below.
+3. For each recalled memory, judge it on ALL of these together, not any one
    alone: service identity, symptoms, error patterns, the type of
    infrastructure/resource problem (e.g. DB/connection saturation, memory,
    cache, certs), root cause category, and whether the past resolution
    worked or failed. A different service name never disqualifies a memory
    by itself, and a single shared keyword never qualifies one by itself —
    weigh the overall pattern.
-3. Classify your best candidate as exactly one of:
+4. Follow the supplied classification exactly:
    - Strong match: the failure pattern is essentially the same (root cause
      category + symptom class align closely), even if the service differs.
      State which past incident (date, service), which dimensions aligned,
@@ -65,11 +68,27 @@ Rules:
      match just because something was recalled.
    If the report itself is too vague to judge (no service, no symptom),
    ask ONE clarifying question instead of guessing.
-4. Memories marked WORKED are proven fixes; DID NOT WORK means avoid them.
-5. Keep it tight: under ~150 words, short bullets, commands only when useful.
+5. Memories marked WORKED are proven fixes; DID NOT WORK means avoid them.
+6. Keep it tight: under ~150 words, short bullets, commands only when useful.
    No filler, no long checklists.
 
 Never claim to remember anything that is not in the memories or the chat."""
+
+
+CLASSIFY_PROMPT = """You classify incident-history relevance. Compare the current
+incident with the recalled memories as a group, using the actual failure
+pattern: symptom class, error behavior, affected resource/infrastructure,
+and root cause when known. Service names and isolated shared words are not
+enough to establish a match.
+
+Return only one JSON object: {\"verdict\": \"strong\" | \"partial\" | \"none\", \"evidence\": \"brief explanation\"}.
+
+Use strong only when both the symptom class and underlying failure/root-cause
+category closely align. Use partial when there is a meaningful shared failure
+pattern but important specifics differ or the cause is not established. Use
+none when the memories share only generic terms, describe a different failure,
+or provide no useful precedent. When uncertain, choose none. Never invent
+details absent from the incident or memories."""
 
 
 EXTRACT_PROMPT = """You maintain an incident knowledge base. Read the engineer's
@@ -148,6 +167,33 @@ class MemoryAgent:
             # Open models sometimes return malformed JSON: fall back to the raw report
             return user_input
 
+    def _classify_memories(self, llm: Groq, user_input: str,
+                           memories: list[str]) -> tuple[str, str]:
+        """Choose a conservative verdict before asking the model to write advice."""
+        if not memories:
+            return "none", "No recalled historical incidents."
+        try:
+            raw = llm.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": CLASSIFY_PROMPT},
+                    {"role": "user", "content": (
+                        f"Current incident:\n{user_input}\n\nRecalled memories:\n" +
+                        "\n".join(f"- {memory}" for memory in memories)
+                    )},
+                ],
+            ).choices[0].message.content.strip()
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            result = json.loads(raw)
+            verdict = result.get("verdict")
+            if verdict not in {"strong", "partial", "none"}:
+                return "none", "The recalled memories did not yield a valid match classification."
+            return verdict, str(result.get("evidence", "")).strip()
+        except Exception:
+            # Fail closed: malformed classification must not become a strong match.
+            return "none", "The recalled memories could not be reliably classified."
+
     def respond(self, user_input: str) -> TurnLog:
         hindsight = self._new_hindsight_client()
         llm = self._new_llm_client()
@@ -162,13 +208,18 @@ class MemoryAgent:
             memories = [m.text for m in recall_result.results] if recall_result.results else []
             memories = memories[:MAX_MEMORIES]
             memory_block = "\n".join(f"- {m}" for m in memories) if memories else "(none)"
+            verdict, evidence = self._classify_memories(llm, query, memories)
 
             # 2. RESPOND: short-term history + long-term memories
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages += self.history[-MAX_HISTORY_MESSAGES:]
             messages.append({
                 "role": "user",
-                "content": f"Relevant memories:\n{memory_block}\n\nEngineer: {user_input}",
+                "content": (
+                    f"Historical-match verdict: {verdict}\n"
+                    f"Classification evidence: {evidence}\n\n"
+                    f"Relevant memories:\n{memory_block}\n\nEngineer: {user_input}"
+                ),
             })
             response = llm.chat.completions.create(
                 model=self.model, messages=messages
