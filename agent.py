@@ -8,6 +8,14 @@ Per turn:
   3. RETAIN   -> a small extraction step saves only clean facts (incident
                  reports, confirmed outcomes). The agent's own suggestions are
                  NOT stored as facts, so they can't come back as fake "past incidents".
+
+IMPORTANT: the Hindsight/Groq clients are created FRESH on every respond()
+call rather than once in __init__. In Streamlit, a persisted agent object
+(cached with @st.cache_resource) can get re-invoked from a different thread
+on a later rerun than the one that created it, and a long-lived async HTTP
+client bound to the original thread's event loop then fails with
+"Event loop is closed". Only plain data (chat history, bank_id) survives
+across calls on this class; network clients never do.
 """
 
 import os
@@ -24,7 +32,10 @@ load_dotenv()
 BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "oncall-history")
 
 MAX_HISTORY_MESSAGES = 6   # short-term memory: last 3 exchanges
-MAX_MEMORIES = 5           # cap recalled memories fed to the LLM
+RECALL_LIMIT = 12          # ask Hindsight for this many raw candidates...
+MAX_MEMORIES = 8           # ...then feed up to this many to the LLM (it already
+                            # reasons about which are actually relevant, so err
+                            # toward more candidates rather than fewer)
 
 
 SYSTEM_PROMPT = """You are an on-call incident response assistant. You have
@@ -92,22 +103,27 @@ class TurnLog:
 class MemoryAgent:
     def __init__(self, bank_id: str = BANK_ID):
         self.bank_id = bank_id
-        self.hindsight = Hindsight(
-            base_url=os.environ["HINDSIGHT_BASE_URL"],
-            api_key=os.environ["HINDSIGHT_API_KEY"],
-        )
-        self.llm = Groq(api_key=os.environ["GROQ_API_KEY"])
         self.model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
         self.history = []            # short-term chat messages
         self.last_user_message = ""  # used to widen the recall query
+        # No client objects stored here on purpose — see module docstring.
         # Hindsight creates the bank on the first retain() with a new bank_id.
+
+    def _new_hindsight_client(self) -> Hindsight:
+        return Hindsight(
+            base_url=os.environ["HINDSIGHT_BASE_URL"],
+            api_key=os.environ["HINDSIGHT_API_KEY"],
+        )
+
+    def _new_llm_client(self) -> Groq:
+        return Groq(api_key=os.environ["GROQ_API_KEY"])
 
     def reset_conversation(self):
         """Clears short-term chat only; long-term Hindsight memory is untouched."""
         self.history = []
         self.last_user_message = ""
 
-    def _extract_memory(self, user_input: str) -> str:
+    def _extract_memory(self, llm: Groq, user_input: str) -> str:
         """Turn the engineer's message into a clean fact worth retaining."""
         prev_suggestion = ""
         if self.history and self.history[-1]["role"] == "assistant":
@@ -118,7 +134,7 @@ class MemoryAgent:
             f"Engineer's latest message: {user_input}"
         )
         try:
-            out = self.llm.chat.completions.create(
+            out = llm.chat.completions.create(
                 model=self.model,
                 temperature=0,
                 messages=[
@@ -136,32 +152,37 @@ class MemoryAgent:
             return user_input
 
     def respond(self, user_input: str) -> TurnLog:
-        # 1. RECALL: widen the query with the previous message for follow-ups
-        query = user_input
-        if self.last_user_message:
-            query = f"{self.last_user_message[:500]}\n{user_input}"
-        recall_result = self.hindsight.recall(bank_id=self.bank_id, query=query)
-        memories = [m.text for m in recall_result.results] if recall_result.results else []
-        memories = memories[:MAX_MEMORIES]
-        memory_block = "\n".join(f"- {m}" for m in memories) if memories else "(none)"
+        hindsight = self._new_hindsight_client()
+        llm = self._new_llm_client()
+        try:
+            # 1. RECALL: widen the query with the previous message for follow-ups
+            query = user_input
+            if self.last_user_message:
+                query = f"{self.last_user_message[:500]}\n{user_input}"
+            recall_result = hindsight.recall(bank_id=self.bank_id, query=query, limit=RECALL_LIMIT)
+            memories = [m.text for m in recall_result.results] if recall_result.results else []
+            memories = memories[:MAX_MEMORIES]
+            memory_block = "\n".join(f"- {m}" for m in memories) if memories else "(none)"
 
-        # 2. RESPOND: short-term history + long-term memories
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages += self.history[-MAX_HISTORY_MESSAGES:]
-        messages.append({
-            "role": "user",
-            "content": f"Relevant memories:\n{memory_block}\n\nEngineer: {user_input}",
-        })
-        response = self.llm.chat.completions.create(
-            model=self.model, messages=messages
-        ).choices[0].message.content
+            # 2. RESPOND: short-term history + long-term memories
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages += self.history[-MAX_HISTORY_MESSAGES:]
+            messages.append({
+                "role": "user",
+                "content": f"Relevant memories:\n{memory_block}\n\nEngineer: {user_input}",
+            })
+            response = llm.chat.completions.create(
+                model=self.model, messages=messages
+            ).choices[0].message.content
 
-        # 3. RETAIN: only clean facts, never the agent's own advice
-        summary = self._extract_memory(user_input)
-        retained = ""
-        if summary:
-            retained = f"[{date.today().isoformat()}] {summary}"
-            self.hindsight.retain(bank_id=self.bank_id, content=retained)
+            # 3. RETAIN: only clean facts, never the agent's own advice
+            summary = self._extract_memory(llm, user_input)
+            retained = ""
+            if summary:
+                retained = f"[{date.today().isoformat()}] {summary}"
+                hindsight.retain(bank_id=self.bank_id, content=retained)
+        finally:
+            hindsight.close()
 
         self.history.append({"role": "user", "content": user_input})
         self.history.append({"role": "assistant", "content": response})
@@ -171,4 +192,6 @@ class MemoryAgent:
                        response=response, retained=retained)
 
     def close(self):
-        self.hindsight.close()
+        # No persistent client to close anymore — kept for backward
+        # compatibility with chat.py/demo.py/app.py, which all call this.
+        pass
